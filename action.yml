@@ -1,0 +1,738 @@
+name: pytest-queryguard
+description: >-
+  Run pytest with pytest-queryguard and upload its findings (N+1 queries,
+  repeated statements, missing indexes) to GitHub code scanning as SARIF.
+author: MaciejZiel
+branding:
+  icon: database
+  color: purple
+
+inputs:
+  pytest-args:
+    description: >-
+      Arguments for pytest, as in a shell: quotes work, for example
+      -k "orders or users" tests/.
+    required: false
+    default: ""
+  python-version:
+    description: >-
+      Python version to set up (for example 3.12). Empty: use the python that
+      is already on PATH, for example from your own setup-python step.
+    required: false
+    default: ""
+  package:
+    description: >-
+      What to pip install for the plugin: a requirement such as
+      "pytest-queryguard>=0.6" or a path to a checkout. Empty (the default):
+      install the plugin from the checkout of this action, so the plugin
+      version is the one the action's own ref ships. The action needs 0.6.0
+      or newer (it passes --queryguard-sarif and --queryguard-json and runs
+      python -m pytest_queryguard.compare, which older plugin versions lack),
+      0.8.0 or newer for the trend input, and 0.10.0 or newer for the lint
+      input (python -m pytest_queryguard.lint --format github). pytest and
+      SQLAlchemy come with it. Your own project and its test dependencies
+      must be installed before this action runs.
+    required: false
+    default: ""
+  baseline:
+    description: >-
+      Path of a baseline file (--queryguard-baseline). Findings in it are
+      neither reported nor uploaded. Empty: use queryguard_baseline from your
+      pytest configuration, if any.
+    required: false
+    default: ""
+  fail:
+    description: >-
+      "true": the step fails when pytest fails, as in a normal run. "false":
+      a failed test run does not fail the step, findings are only uploaded.
+      An invalid input or a failed install still fails it. The switches
+      (fail, upload, compare, comment) take "true" or "false" only; anything
+      else stops the action.
+    required: false
+    default: "true"
+  working-directory:
+    description: Directory to run pytest in.
+    required: false
+    default: "."
+  sarif-file:
+    description: Where to write the SARIF file, relative to working-directory.
+    required: false
+    default: queryguard.sarif
+  upload:
+    description: >-
+      "true": upload the SARIF file to code scanning. Skipped on pull requests
+      from forks and on runs triggered by Dependabot, where the token is
+      read-only. "false": only write the file.
+    required: false
+    default: "true"
+  category:
+    description: >-
+      Code scanning category; use one per job when several jobs upload,
+      including each job of a matrix. It also names the job's query-count
+      artifact (characters an artifact name cannot hold, such as / and :,
+      become -) and pull-request comment.
+    required: false
+    default: pytest-queryguard
+  json-file:
+    description: >-
+      Where to write the per-test query counts (--queryguard-json), relative
+      to working-directory. The file is uploaded as the artifact
+      queryguard-json-<category>, which later runs compare against. Empty: no
+      file, no artifact and no comparison.
+    required: false
+    default: queryguard.json
+  compare:
+    description: >-
+      "true": on a pull request, compare the query counts with the latest run
+      of this workflow on the base branch and write the result to the job
+      summary. Needs the "actions: read" permission. "false": skip.
+    required: false
+    default: "true"
+  comment:
+    description: >-
+      "true": also post the comparison as a pull-request comment, updated in
+      place on later pushes. Needs "pull-requests: write"; skipped on pull
+      requests from forks and Dependabot. "false": job summary only.
+    required: false
+    default: "true"
+  trend:
+    description: >-
+      A number N: on pushes to the default branch and on pull requests, show
+      how the query counts moved over the last N runs (this one and the
+      latest N-1 runs of this workflow on the base branch that have the
+      artifact) in the job summary, and folded into the pull-request comment
+      when there is one. "true" means 10 runs. Needs "actions: read".
+      "false" (the default): skip.
+    required: false
+    default: "false"
+  github-token:
+    description: >-
+      Token for the comparison, the trend, the comment and the list of a pull
+      request's changed files (lint: changed).
+    required: false
+    default: ${{ github.token }}
+  lint:
+    description: >-
+      Experimental. "true": after pytest, run the static check
+      (python -m pytest_queryguard.lint --format github) on lint-paths, so
+      its findings show as warning annotations on the lines they name.
+      "changed": on a pull request, check only the changed Python files
+      under lint-paths (needs "pull-requests: read"); on other events, all of
+      lint-paths. "false" (the default): skip. Its findings do not fail the
+      job (see the lint-exit-code output); a model module that cannot be
+      imported does.
+    required: false
+    default: "false"
+  lint-models:
+    description: >-
+      The modules that define or import your mapped classes, separated by
+      spaces, for example "app.models". Required when lint is not "false".
+      They are imported from working-directory, as in your tests.
+    required: false
+    default: ""
+  lint-paths:
+    description: >-
+      Files and directories for the static check, relative to
+      working-directory, separated by spaces (quotes work as in pytest-args).
+    required: false
+    default: "."
+
+outputs:
+  exit-code:
+    description: Exit code of pytest.
+    value: ${{ steps.pytest.outputs.exit-code }}
+  sarif-file:
+    description: Path of the SARIF file, relative to working-directory.
+    value: ${{ inputs.sarif-file }}
+  json-file:
+    description: Path of the query-count JSON file, relative to working-directory.
+    value: ${{ inputs.json-file }}
+  trend-report:
+    description: >-
+      Path of the trend report (Markdown) when the trend step wrote one,
+      otherwise empty.
+    value: ${{ steps.trend.outputs.report }}
+  lint-exit-code:
+    description: >-
+      Exit code of the static check (0: no finding, 1: findings), or empty
+      when it did not run.
+    value: ${{ steps.lint.outputs.exit-code }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check the inputs
+      id: inputs
+      shell: bash
+      env:
+        QG_FAIL: ${{ inputs.fail }}
+        QG_UPLOAD: ${{ inputs.upload }}
+        QG_COMPARE: ${{ inputs.compare }}
+        QG_COMMENT: ${{ inputs.comment }}
+        QG_TREND: ${{ inputs.trend }}
+        QG_CATEGORY: ${{ inputs.category }}
+        QG_LINT: ${{ inputs.lint }}
+        QG_LINT_MODELS: ${{ inputs.lint-models }}
+      run: |
+        # A typo must not quietly turn a switch off: the later steps test
+        # `inputs.fail == 'true'`, so "yes" or "1" would mean false. GitHub
+        # compares strings ignoring case, so "True" is accepted here too.
+        lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+        bad=0
+        for pair in "fail=$QG_FAIL" "upload=$QG_UPLOAD" "compare=$QG_COMPARE" "comment=$QG_COMMENT"; do
+          name="${pair%%=*}"
+          value="${pair#*=}"
+          case "$(lower "$value")" in
+            true | false) ;;
+            *)
+              echo "::error::input $name must be \"true\" or \"false\", not \"$value\""
+              bad=1
+              ;;
+          esac
+        done
+        # trend-runs: the number of runs, empty for no trend
+        runs=""
+        trend="$(lower "$QG_TREND")"
+        case "$trend" in
+          "" | false) ;;
+          true) runs=10 ;;
+          *)
+            # at most three digits, so that the arithmetic cannot overflow;
+            # 10#: "08" is eight, not an octal error
+            if [[ "$trend" =~ ^[0-9]{1,3}$ ]] && [ "$((10#$trend))" -ge 2 ] && [ "$((10#$trend))" -le 100 ]; then
+              runs="$((10#$trend))"
+            else
+              echo "::error::input trend must be \"false\", \"true\" or a number of runs from 2 to 100, not \"$QG_TREND\""
+              bad=1
+            fi
+            ;;
+        esac
+        if [ -z "$QG_CATEGORY" ]; then
+          echo "::error::input category must not be empty"
+          bad=1
+        fi
+        # lint: "all", "changed" or empty for no static check
+        lint=""
+        case "$(lower "$QG_LINT")" in
+          false) ;;
+          true) lint=all ;;
+          changed) lint=changed ;;
+          *)
+            echo "::error::input lint must be \"true\", \"changed\" or \"false\", not \"$QG_LINT\""
+            bad=1
+            ;;
+        esac
+        if [ -n "$lint" ]; then
+          # module names only: they become --models arguments
+          module='[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*'
+          if ! [[ "$QG_LINT_MODELS" =~ ^[[:space:]]*$module([[:space:]]+$module)*[[:space:]]*$ ]]; then
+            echo "::error::input lint-models must be module names separated by spaces, such as \"app.models\", not \"$QG_LINT_MODELS\""
+            bad=1
+          fi
+        fi
+        if [ "$bad" != 0 ]; then
+          exit 1
+        fi
+        # The category names the artifact too, and an artifact name cannot
+        # hold " : < > | * ? \ / or a line break, which a code scanning
+        # category may (/language:python). Those become "-".
+        artifact="queryguard-json-$(printf '%s' "$QG_CATEGORY" | tr '":<>|*?\\/\r\n' '-----------')"
+        echo "artifact=$artifact" >> "$GITHUB_OUTPUT"
+        echo "trend-runs=$runs" >> "$GITHUB_OUTPUT"
+        echo "lint=$lint" >> "$GITHUB_OUTPUT"
+
+    - name: Set up Python
+      if: inputs.python-version != ''
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install pytest-queryguard
+      shell: bash
+      env:
+        QG_PACKAGE: ${{ inputs.package }}
+        QG_ACTION_PATH: ${{ github.action_path }}
+      run: |
+        # No package given: install the plugin that this action's own ref
+        # ships, so it always matches the ref the workflow pinned and
+        # understands --queryguard-sarif. In MaciejZiel/pytest-queryguard that
+        # is the checkout one level above action/; in the Marketplace copy,
+        # MaciejZiel/pytest-queryguard-action, it is the release's wheel in
+        # dist/ (the file that was published to PyPI), so a commit SHA of
+        # either repository fixes the plugin code too.
+        if [ -z "$QG_PACKAGE" ]; then
+          if [ -f "$QG_ACTION_PATH/../pyproject.toml" ]; then
+            QG_PACKAGE="$QG_ACTION_PATH/.."
+          else
+            shopt -s nullglob
+            wheels=("$QG_ACTION_PATH"/dist/pytest_queryguard-*-py3-none-any.whl)
+            shopt -u nullglob
+            if [ "${#wheels[@]}" -ne 1 ]; then
+              echo "::error::found ${#wheels[@]} pytest-queryguard wheels in $QG_ACTION_PATH/dist and no pyproject.toml above the action; set the package input"
+              exit 1
+            fi
+            QG_PACKAGE="${wheels[0]}"
+          fi
+        fi
+        python -m pip install --disable-pip-version-check "$QG_PACKAGE"
+
+    - name: Run pytest
+      id: pytest
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        QG_ARGS: ${{ inputs.pytest-args }}
+        QG_BASELINE: ${{ inputs.baseline }}
+        QG_SARIF: ${{ inputs.sarif-file }}
+        QG_JSON: ${{ inputs.json-file }}
+      run: |
+        # The inputs reach the shell as environment variables, never spliced into
+        # the script. pytest-args is split into words with Python's shlex; no
+        # shell evaluates it, so $(...) and backticks stay literal text. The
+        # words go through a file so that a value shlex cannot split (an
+        # unclosed quote) stops the step instead of running pytest without
+        # them; as bytes, so no console encoding or newline translation of
+        # Windows touches them.
+        extra=()
+        if [ -n "$QG_BASELINE" ]; then
+          extra+=("--queryguard-baseline=$QG_BASELINE")
+        fi
+        if [ -n "$QG_JSON" ]; then
+          extra+=("--queryguard-json=$QG_JSON")
+        fi
+        args=()
+        if [ -n "$QG_ARGS" ]; then
+          words="$(mktemp)"
+          if ! python -c 'import os,shlex,sys; sys.stdout.buffer.write(b"".join(os.fsencode(w) + b"\0" for w in shlex.split(os.environ["QG_ARGS"])))' > "$words"; then
+            rm -f "$words"
+            echo "::error::pytest-args cannot be split into words (an unclosed quote?): $QG_ARGS"
+            exit 1
+          fi
+          while IFS= read -r -d '' word; do
+            args+=("$word")
+          done < "$words"
+          rm -f "$words"
+        fi
+        set +e
+        python -m pytest "--queryguard-sarif=$QG_SARIF" "${extra[@]}" "${args[@]}"
+        code=$?
+        set -e
+        echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+        # 1 is failed tests (a finding fails its test); the others mean that
+        # pytest did not run the tests as asked, which fail: "false" hides.
+        case "$code" in
+          0 | 1) ;;
+          2) echo "::warning::pytest was interrupted (exit code 2)" ;;
+          3) echo "::warning::pytest stopped on an internal error (exit code 3)" ;;
+          4) echo "::warning::pytest could not use its arguments or configuration (exit code 4)" ;;
+          5) echo "::warning::pytest collected no tests (exit code 5)" ;;
+          *) echo "::warning::pytest exited with code $code" ;;
+        esac
+        if [ ! -f "$QG_SARIF" ]; then
+          echo "::warning::pytest did not write $QG_SARIF (exit code $code)"
+        fi
+
+    - name: Find the SARIF file
+      id: sarif
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        QG_SARIF: ${{ inputs.sarif-file }}
+      run: |
+        # The path goes to JavaScript actions, which on Windows need D:\a\...,
+        # not the /d/a/... of Git Bash.
+        if [ -f "$QG_SARIF" ]; then
+          path="$(realpath "$QG_SARIF")"
+          if command -v cygpath > /dev/null; then
+            path="$(cygpath -w "$path")"
+          fi
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Upload SARIF to code scanning
+      if: >-
+        !cancelled() && inputs.upload == 'true' && steps.sarif.outputs.path != ''
+        && github.actor != 'dependabot[bot]'
+        && !(github.event_name == 'pull_request'
+        && github.event.pull_request.head.repo.full_name != github.repository)
+      # An upload that is refused (read-only token in a case not listed above)
+      # must not fail a job whose tests passed.
+      continue-on-error: true
+      uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+      with:
+        sarif_file: ${{ steps.sarif.outputs.path }}
+        category: ${{ inputs.category }}
+
+    - name: Find the JSON file
+      id: json
+      if: "!cancelled() && steps.pytest.outcome == 'success'"
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        QG_JSON: ${{ inputs.json-file }}
+      run: |
+        if [ -z "$QG_JSON" ]; then
+          exit 0
+        fi
+        if [ -f "$QG_JSON" ]; then
+          path="$(realpath "$QG_JSON")"
+          if command -v cygpath > /dev/null; then
+            path="$(cygpath -w "$path")"
+          fi
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+        else
+          echo "::warning::pytest did not write $QG_JSON; the query counts are not uploaded or compared"
+        fi
+
+    - name: Upload the query counts
+      if: "!cancelled() && steps.json.outputs.path != ''"
+      continue-on-error: true
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: ${{ steps.inputs.outputs.artifact }}
+        path: ${{ steps.json.outputs.path }}
+        retention-days: 30
+        overwrite: true
+
+    - name: Compare the query counts with the base branch
+      id: compare
+      if: >-
+        !cancelled() && inputs.compare == 'true' && steps.json.outputs.path != ''
+        && github.event_name == 'pull_request'
+      # The comparison is information: it never fails the job.
+      continue-on-error: true
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        QG_REPO: ${{ github.repository }}
+        QG_BASE: ${{ github.event.pull_request.base.ref }}
+        QG_WORKFLOW_REF: ${{ github.workflow_ref }}
+        QG_CATEGORY: ${{ inputs.category }}
+        QG_ARTIFACT: ${{ steps.inputs.outputs.artifact }}
+        QG_HEAD_JSON: ${{ steps.json.outputs.path }}
+        QG_TMP: ${{ runner.temp }}
+      run: |
+        # The workflow file of this run, e.g. ci.yml, from
+        # owner/repo/.github/workflows/ci.yml@refs/pull/1/merge
+        workflow="${QG_WORKFLOW_REF%%@*}"
+        workflow="${workflow##*/}"
+        dir="$QG_TMP/queryguard-base"
+        # the latest finished runs of this workflow on the base branch, of any
+        # event but a pull request (push, schedule); the artifact is uploaded
+        # whether the tests passed or not. Pull-request runs are left out, as
+        # in the trend step: a fork's pull request from its own "main" has the
+        # head branch main too. gh's messages go to a file, not among the ids.
+        errors="$QG_TMP/queryguard-compare-gh.txt"
+        if ! runs="$(gh run list -R "$QG_REPO" --workflow "$workflow" --branch "$QG_BASE" \
+            --status completed --limit 20 --json databaseId,event \
+            --jq '.[] | select(.event | startswith("pull_request") | not) | .databaseId' 2>"$errors")"; then
+          {
+            echo "### pytest-queryguard: query counts not compared"
+            echo
+            echo "Listing the runs of \`$workflow\` failed; the job needs the \`actions: read\` permission."
+            echo
+            echo '```'
+            cat "$errors"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+        found=""
+        for run in $runs; do
+          rm -rf "$dir"
+          if gh run download "$run" -R "$QG_REPO" -n "$QG_ARTIFACT" -D "$dir" 2>/dev/null; then
+            found="$run"
+            break
+          fi
+        done
+        report="$QG_TMP/queryguard-compare.md"
+        if [ -z "$found" ]; then
+          {
+            echo "### pytest-queryguard: no query counts of the base branch"
+            echo
+            echo "No run of \`$workflow\` on \`$QG_BASE\` has the artifact $QG_ARTIFACT yet. It appears after this workflow runs on a push to \`$QG_BASE\` with this version of the action."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+        base_json="$(find "$dir" -name '*.json' -type f | head -n 1)"
+        key=""
+        if [ "$QG_CATEGORY" != "pytest-queryguard" ]; then
+          key="$QG_CATEGORY"
+        fi
+        python -m pytest_queryguard.compare "$base_json" "$QG_HEAD_JSON" --key "$key" --output "$report" > /dev/null
+        cat "$report" >> "$GITHUB_STEP_SUMMARY"
+        echo "report=$report" >> "$GITHUB_OUTPUT"
+
+    - name: Show the query-count trend
+      id: trend
+      if: >-
+        !cancelled() && steps.inputs.outputs.trend-runs != ''
+        && steps.json.outputs.path != ''
+        && (github.event_name == 'pull_request'
+        || (github.event_name == 'push'
+        && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)))
+      # The trend is information: it never fails the job.
+      continue-on-error: true
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        QG_REPO: ${{ github.repository }}
+        QG_BRANCH: ${{ github.event.pull_request.base.ref || github.ref_name }}
+        QG_WORKFLOW_REF: ${{ github.workflow_ref }}
+        QG_CATEGORY: ${{ inputs.category }}
+        QG_ARTIFACT: ${{ steps.inputs.outputs.artifact }}
+        QG_RUNS: ${{ steps.inputs.outputs.trend-runs }}
+        QG_HEAD_JSON: ${{ steps.json.outputs.path }}
+        QG_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        QG_TMP: ${{ runner.temp }}
+      run: |
+        # QG_RUNS: 2 to 100, checked and normalized by the first step
+        workflow="${QG_WORKFLOW_REF%%@*}"
+        workflow="${workflow##*/}"
+        dir="$QG_TMP/queryguard-trend"
+        rm -rf "$dir"
+        mkdir -p "$dir"
+        wanted=$((QG_RUNS - 1))
+        # newest first: run id and commit of the finished runs of this workflow
+        # on the branch. Pull-request runs are left out: a fork's pull request
+        # from its own "main" has the head branch main too. One run per commit
+        # (a re-run or a schedule repeats one), and not this run's commit.
+        # Some runs have no artifact (expired, or the job stopped before
+        # writing it), so a few more are listed.
+        files=()
+        labels=()
+        seen=" $QG_SHA "
+        if runs="$(gh run list -R "$QG_REPO" --workflow "$workflow" --branch "$QG_BRANCH" \
+            --status completed --limit $((wanted * 2 + 10)) --json databaseId,headSha,event \
+            --jq '.[] | select(.event | startswith("pull_request") | not) | "\(.databaseId) \(.headSha)"')"; then
+          while read -r run sha; do
+            [ "${#files[@]}" -ge "$wanted" ] && break
+            [ -n "$run" ] || continue
+            case "$seen" in *" $sha "*) continue ;; esac
+            if gh run download "$run" -R "$QG_REPO" -n "$QG_ARTIFACT" -D "$dir/$run" 2>/dev/null; then
+              file="$(find "$dir/$run" -name '*.json' -type f | head -n 1)"
+              if [ -n "$file" ]; then
+                seen="$seen$sha "
+                files=("$file" "${files[@]}")
+                labels=("${sha:0:7}" "${labels[@]}")
+              fi
+            fi
+          done <<< "$runs"
+        else
+          echo "::warning::listing the runs of $workflow failed (the job needs the actions: read permission); the trend has this run only"
+        fi
+        # the files oldest first, then one --label per file in the same order
+        args=("${files[@]}" "$QG_HEAD_JSON")
+        for label in "${labels[@]}" "${QG_SHA:0:7} (this run)"; do
+          args+=(--label "$label")
+        done
+        key=""
+        if [ "$QG_CATEGORY" != "pytest-queryguard" ]; then
+          key="$QG_CATEGORY"
+        fi
+        report="$QG_TMP/queryguard-trend.md"
+        folded="$QG_TMP/queryguard-trend-details.md"
+        # an artifact that cannot be read (another format) is left out
+        python -m pytest_queryguard.trend "${args[@]}" --key "$key" --skip-unreadable --output "$report" > /dev/null
+        python -m pytest_queryguard.trend "${args[@]}" --key "$key" --skip-unreadable --details --output "$folded" > /dev/null 2>&1
+        cat "$report" >> "$GITHUB_STEP_SUMMARY"
+        echo "report=$report" >> "$GITHUB_OUTPUT"
+        echo "details=$folded" >> "$GITHUB_OUTPUT"
+
+    - name: Comment the comparison on the pull request
+      if: >-
+        !cancelled() && inputs.comment == 'true' && steps.compare.outputs.report != ''
+        && github.actor != 'dependabot[bot]'
+        && github.event.pull_request.head.repo.full_name == github.repository
+      continue-on-error: true
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        QG_REPO: ${{ github.repository }}
+        QG_PR: ${{ github.event.pull_request.number }}
+        QG_REPORT: ${{ steps.compare.outputs.report }}
+        QG_TREND: ${{ steps.trend.outputs.details }}
+        QG_TMP: ${{ runner.temp }}
+      run: |
+        # The comparison, then the trend folded below it, so that the comment
+        # keeps the comparison's marker on its first line. GitHub refuses a
+        # comment over 65536 characters: the trend is left out when it does
+        # not fit, and a comparison that does not fit is cut at a line (both
+        # stay whole in the job summary).
+        body="$QG_TMP/queryguard-comment.md"
+        python -c '
+        import os, sys
+        limit = 65000  # characters, with room for the note below
+        def read(name):
+            path = os.environ.get(name, "")
+            if not path or not os.path.isfile(path):
+                return ""
+            with open(path, encoding="utf-8", errors="replace") as handle:
+                return handle.read()
+        report, trend = read("QG_REPORT"), read("QG_TREND")
+        note = "\n\n_{} is in the job summary: the comment would be longer than GitHub allows._\n"
+        if trend and len(report) + 1 + len(trend) <= limit:
+            body = report + "\n" + trend
+        elif len(report) <= limit:
+            body = report + (note.format("The trend") if trend else "")
+        else:
+            body = report[: report.rfind("\n", 0, limit) + 1]
+            # close a <details> the cut left open, so the note is not folded
+            body += "\n</details>\n" * (body.count("<details>") - body.count("</details>"))
+            body += note.format("The whole comparison")
+        with open(sys.argv[1], "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(body)
+        ' "$body"
+        # One comment per category: this action's own comment, found by the
+        # marker on its first line and by its author, so that a comment of
+        # anyone else that quotes the marker is never edited. The author is
+        # the token's user (a personal access token), or else a bot:
+        # github-actions[bot] for the default token, the app for an app's
+        # token; GitHub refuses (403) to name the user of those two.
+        errors="$QG_TMP/queryguard-comment-gh.txt"
+        if QG_LOGIN="$(gh api user --jq .login 2> "$errors")"; then
+          :
+        elif grep -q "HTTP 403" "$errors"; then
+          QG_LOGIN=""
+        else
+          echo "::warning::the token's user could not be looked up, so no comment was written: $(head -c 500 "$errors" | tr '\n' ' ')"
+          exit 0
+        fi
+        QG_MARKER="$(head -n 1 "$body")"
+        export QG_MARKER QG_LOGIN
+        if ! found="$(gh api --paginate "repos/$QG_REPO/issues/$QG_PR/comments" \
+            --jq '.[] | select((if env.QG_LOGIN != "" then .user.login == env.QG_LOGIN else .user.type == "Bot" end) and (.body | startswith(env.QG_MARKER))) | .id' \
+            2> "$errors")"; then
+          echo "::warning::the pull-request comments could not be listed, so no comment was written: $(head -c 500 "$errors" | tr '\n' ' ')"
+          exit 0
+        fi
+        # Newest first: with a bot's token the list may hold a comment of
+        # another bot (an earlier run with another token), which this token
+        # may not edit; then the next one is tried, and else a new one posted.
+        # Without "pull-requests: write" GitHub refuses every write; the job
+        # summary still has the report, so that is a warning, not a failed step.
+        for id in $(printf '%s\n' "$found" | awk 'NF { ids[++n] = $0 } END { for (i = n; i > 0; i--) print ids[i] }'); do
+          if gh api -X PATCH "repos/$QG_REPO/issues/comments/$id" -F "body=@$body" > /dev/null 2> "$errors"; then
+            exit 0
+          fi
+        done
+        if ! gh api -X POST "repos/$QG_REPO/issues/$QG_PR/comments" -F "body=@$body" > /dev/null 2> "$errors"; then
+          echo "::warning::the pull-request comment was not written (the job needs the pull-requests: write permission): $(head -c 500 "$errors" | tr '\n' ' ')"
+        fi
+
+    - name: Run the static check
+      id: lint
+      # last but one: a check that cannot run fails this step, and no step
+      # after it (the SARIF upload, the comparison) may be skipped for that.
+      # Not after an invalid input or a failed install (pytest did not run).
+      if: >-
+        !cancelled() && steps.inputs.outputs.lint != ''
+        && steps.pytest.outcome == 'success'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        QG_LINT: ${{ steps.inputs.outputs.lint }}
+        QG_LINT_MODELS: ${{ inputs.lint-models }}
+        QG_LINT_PATHS: ${{ inputs.lint-paths }}
+        QG_PR: ${{ github.event.pull_request.number }}
+        QG_REPO: ${{ github.repository }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        QG_TMP: ${{ runner.temp }}
+      run: |
+        # QG_LINT: "all" or "changed"; QG_LINT_MODELS: module names, checked
+        # by the first step, so splitting them on spaces is safe.
+        models=()
+        for name in $QG_LINT_MODELS; do
+          models+=("--models=$name")
+        done
+        changed=""
+        if [ "$QG_LINT" = changed ] && [ -n "$QG_PR" ]; then
+          changed="$QG_TMP/queryguard-lint-changed.txt"
+          errors="$QG_TMP/queryguard-lint-gh.txt"
+          if ! gh api --paginate "repos/$QG_REPO/pulls/$QG_PR/files" \
+              --jq '.[] | select(.status != "removed") | .filename' > "$changed" 2> "$errors"; then
+            echo "::warning::the changed files of the pull request could not be listed (the job needs the pull-requests: read permission), so all of lint-paths is checked: $(head -c 500 "$errors" | tr '\n' ' ')"
+            changed=""
+          elif [ "$(wc -l < "$changed")" -ge 3000 ]; then
+            # GitHub lists at most 3000 files of a pull request
+            echo "::warning::the pull request changes 3000 files or more, more than GitHub lists, so all of lint-paths is checked"
+            changed=""
+          fi
+        fi
+        # The paths, split like pytest-args; with "changed", the changed
+        # Python files that are in one of them (GitHub names them relative to
+        # the repository root). As NUL-separated bytes, like pytest-args.
+        # The root of the checkout, which GitHub's file names and the
+        # annotations are relative to: actions/checkout may put it below the
+        # workspace (its "path:" input).
+        root="$(git rev-parse --show-toplevel 2> /dev/null)" || root=""
+        root="${root:-${GITHUB_WORKSPACE:-$PWD}}"
+        list="$(mktemp)"
+        set +e
+        QG_ROOT="$root" QG_CHANGED="$changed" python -c '
+        import os, shlex, sys
+        try:
+            paths = shlex.split(os.environ["QG_LINT_PATHS"]) or ["."]
+        except ValueError:
+            sys.exit(3)
+        changed = os.environ["QG_CHANGED"]
+        if changed:
+            roots = [os.path.realpath(p) for p in paths]
+            with open(changed, encoding="utf-8", errors="surrogateescape") as handle:
+                names = [n for n in handle.read().splitlines() if n.endswith(".py")]
+            selected = []
+            for name in names:
+                full = os.path.realpath(os.path.join(os.environ["QG_ROOT"], name))
+                if os.path.isfile(full) and any(
+                    full == root or full.startswith(root.rstrip(os.sep) + os.sep)
+                    for root in roots
+                ):
+                    selected.append(full)
+            paths = selected
+        sys.stdout.buffer.write(b"".join(os.fsencode(p) + b"\0" for p in paths))
+        ' > "$list"
+        code=$?
+        set -e
+        if [ "$code" != 0 ]; then
+          rm -f "$list"
+          if [ "$code" = 3 ]; then
+            echo "::error::lint-paths cannot be split into words (an unclosed quote?): $QG_LINT_PATHS"
+          else
+            echo "::error::the files for the static check could not be listed (exit code $code); the message is above"
+          fi
+          exit 1
+        fi
+        files=()
+        while IFS= read -r -d '' file; do
+          files+=("$file")
+        done < "$list"
+        rm -f "$list"
+        if [ "${#files[@]}" -eq 0 ]; then
+          echo "No changed Python file in lint-paths: the static check did not run."
+          exit 0
+        fi
+        set +e
+        # "--": a path that starts with "-" is still a path
+        GITHUB_WORKSPACE="$root" python -m pytest_queryguard.lint --format github "${models[@]}" -- "${files[@]}"
+        code=$?
+        set -e
+        echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+        # 1 is findings, which are warnings; anything else means it could not
+        # run (a model module that cannot be imported, a missing path)
+        if [ "$code" -gt 1 ]; then
+          echo "::error::the static check could not run (exit code $code); its message is above"
+          exit 1
+        fi
+
+    - name: Fail when pytest failed
+      # Not after a failed step before it (an invalid input, a failed
+      # install): the job fails already, and pytest has no exit code.
+      if: >-
+        !cancelled() && inputs.fail == 'true' && steps.pytest.outcome == 'success'
+        && steps.pytest.outputs.exit-code != '0'
+      shell: bash
+      env:
+        QG_CODE: ${{ steps.pytest.outputs.exit-code }}
+      run: |
+        echo "::error::pytest exited with code ${QG_CODE:-unknown}"
+        exit 1
